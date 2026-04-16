@@ -11,30 +11,61 @@ st.title("The AI Power Nexus: 2026-2030")
 st.markdown("Simulate the physical grid impact and societal cost of human-driven AI demand using live grid data.")
 
 # --- 1. DATA CONNECTIONS (GOOGLE SHEETS & API) ---
-SHEET_ID = "1W8mwsKK8_IrSxX3iOXybz1X1rMI74AFY3E20riJO8KM"
+# --- 1. DATA CONNECTIONS (GOOGLE SHEETS & API) ---
+SHEET_ID = "1oRgI3uZP8WINBRU6GfybW0K8BUvoz2YHXuQ0Y02QLCY"
 EIA_API_KEY = "egUujavB2YGwnp3NE2Wa6qgJzLzHkWPJXVEZ3FDn"
 
-@st.cache_data(ttl=600) # Caches data for 10 minutes to stay fast
+@st.cache_data(ttl=600)
 def load_master_log(sheet_id):
-    base_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&sheet="
+    # Fetch the flat CSV from the single sheet
+    base_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv"
+    raw_df = pd.read_csv(base_url, header=None, names=list(range(10)))
     
-    # Load and clean demographics
-    df_demo = pd.read_csv(base_url + "State_Demographics")
-    for col in ['Pop_Share_Pct', 'Addressable_Age_Pct', 'AI_Adoption_Pct', 'Casual_Pct', 'Thinker_Pct', 'Creator_Pct', 'Architect_Pct']:
-        df_demo[col] = df_demo[col].str.rstrip('%').astype('float') / 100.0
+    # Parse the single sheet into our four distinct DataFrames based on the "TAB:" markers
+    tab_indices = raw_df[raw_df[0].astype(str).str.startswith("TAB:")].index.tolist()
+    tab_indices.append(len(raw_df))
+    
+    dataframes = {}
+    for i in range(len(tab_indices) - 1):
+        start_idx = tab_indices[i]
+        end_idx = tab_indices[i+1]
+        tab_name = str(raw_df.iloc[start_idx, 0]).replace("TAB:", "").strip()
         
-    df_tech = pd.read_csv(base_url + "Tech_Costs_LCOE_2026")
-    df_benchmarks = pd.read_csv(base_url + "AI_Demand_Benchmarks")
-    df_globals = pd.read_csv(base_url + "Global_Variables")
+        # Extract the chunk and set the headers
+        chunk = raw_df.iloc[start_idx+1 : end_idx].dropna(how='all')
+        if not chunk.empty:
+            chunk.columns = chunk.iloc[0]
+            chunk = chunk[1:].dropna(axis=1, how='all').reset_index(drop=True)
+            dataframes[tab_name] = chunk
+            
+    # Assign the parsed chunks
+    df_demo = dataframes.get("State_Demographics", pd.DataFrame())
+    df_tech = dataframes.get("Tech_Costs_LCOE_2026", pd.DataFrame())
+    df_benchmarks = dataframes.get("AI_Demand_Benchmarks", pd.DataFrame())
+    df_globals = dataframes.get("Global_Variables", pd.DataFrame())
     
+    # Clean the demographic percentages
+    for col in ['Pop_Share_Pct', 'Addressable_Age_Pct', 'AI_Adoption_Pct', 'Casual_Pct', 'Thinker_Pct', 'Creator_Pct', 'Architect_Pct']:
+        if col in df_demo.columns:
+            df_demo[col] = df_demo[col].astype(str).str.rstrip('%').astype('float') / 100.0
+            
+    # Convert benchmark numbers
+    for col in ['Tasks_Per_Day', 'Energy_Per_Task_Wh', 'Cooling_Tax_PUE']:
+        if col in df_benchmarks.columns:
+            df_benchmarks[col] = df_benchmarks[col].astype(float)
+            
+    # Convert tech cost numbers
+    for col in ['LCOE_USD_per_MWh', 'Est_CAPEX_per_MW', 'Nameplate_Multiplier']:
+        if col in df_tech.columns:
+            df_tech[col] = df_tech[col].astype(float)
+            
     return df_demo, df_tech, df_benchmarks, df_globals
 
 try:
     df_demo, df_tech, df_benchmarks, df_globals = load_master_log(SHEET_ID)
 except Exception as e:
-    st.error("Could not load Google Sheet. Check link sharing settings.")
+    st.error(f"Could not parse the Google Sheet. Please check link sharing settings. Error: {e}")
     st.stop()
-
 # Extract Global Variables
 TOTAL_US_POP = float(df_globals.loc[df_globals['Variable_Name'] == 'Total_US_Internet_Pop', 'Value'].values[0])
 SOCIAL_CARBON_COST = float(df_globals.loc[df_globals['Variable_Name'] == 'Social_Cost_Carbon', 'Value'].values[0])
