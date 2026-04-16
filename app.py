@@ -2,27 +2,22 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import requests
 
 # --- PAGE SETUP ---
 st.set_page_config(page_title="The AI Power Nexus", layout="wide")
 st.title("The AI Power Nexus: 2026-2030")
-st.markdown("Simulate the physical grid impact and societal cost of human-driven AI demand.")
 
 # --- 1. DATA CONNECTIONS ---
 SHEET_ID = "1oRgI3uZP8WINBRU6GfybW0K8BUvoz2YHXuQ0Y02QLCY"
-EIA_API_KEY = "egUujavB2YGwnp3NE2Wa6qgJzLzHkWPJXVEZ3FDn"
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=300)
 def load_master_log(sheet_id):
     base_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv"
     raw_df = pd.read_csv(base_url, header=None)
     
     def extract_table(header_marker):
-        # Find row where the first cell matches our header marker
         matches = raw_df[raw_df[0].astype(str).str.strip() == header_marker]
         if matches.empty: return pd.DataFrame()
-        
         start = matches.index[0]
         rows = []
         for i in range(start, len(raw_df)):
@@ -30,75 +25,57 @@ def load_master_log(sheet_id):
             if i > start and (val == '' or val == 'nan' or val.startswith('tab:')):
                 break
             rows.append(raw_df.iloc[i].values)
-            
         df = pd.DataFrame(rows)
-        df.columns = df.iloc[0].astype(str).str.strip()
-        df = df[1:].dropna(axis=1, how='all').reset_index(drop=True)
-        return df
+        df.columns = df.iloc[0] # Temporary columns
+        return df[1:].reset_index(drop=True)
 
-    return extract_table('State'), extract_table('Technology'), extract_table('Archetype'), extract_table('Variable_Name')
+    return extract_table('State'), extract_table('Variable_Name')
 
 # Attempt Load
-try:
-    df_demo, df_tech, df_benchmarks, df_globals = load_master_log(SHEET_ID)
-except:
-    st.error("Connection to Master Log failed. Using built-in defaults.")
-    df_demo = pd.DataFrame()
+df_demo, df_globals = load_master_log(SHEET_ID)
 
-# --- 2. FALLBACKS & DATA CLEANING ---
-# If the sheet fails, we use these constants to keep the app alive
-if df_demo.empty:
-    st.warning("Master Log formatting issue detected. Loading default 2026 constants.")
-    TOTAL_US_POP = 330000000.0
-    SOCIAL_COST = 200.0
-    states_list = ["New Jersey", "New York", "California", "Texas", "Massachusetts"]
-    # Mocking a basic structure for the fallbacks
-    state_data_defaults = {'New Jersey': [0.028, 0.75, 0.50, 0.60, 0.20, 0.10, 0.10]}
-else:
-    # Safe Extraction of Globals
-    try:
-        TOTAL_US_POP = float(df_globals.loc[df_globals['Variable_Name'].str.contains('Pop', na=False), 'Value'].values[0].replace(',', ''))
-    except: TOTAL_US_POP = 330000000.0
-    
-    try:
-        SOCIAL_COST = float(df_globals.loc[df_globals['Variable_Name'].str.contains('Carbon', na=False), 'Value'].values[0])
-    except: SOCIAL_COST = 200.0
-    
-    states_list = df_demo['State'].tolist()
+# --- 2. THE FAIL-SAFE DEFAULTS ---
+# If extraction fails, these are the emergency numbers
+TOTAL_US_POP = 330000000.0
+ADOPT_BASE = 0.50
 
-# --- 3. SIDEBAR ---
-st.sidebar.header("1. Geographic Simulation")
-selected_state = st.sidebar.selectbox("Select Target State", states_list)
+# --- 3. SIDEBAR & LOGIC ---
+st.sidebar.header("Geographic Simulation")
 
 if not df_demo.empty:
-    s_row = df_demo[df_demo['State'] == selected_state].iloc[0]
-    # Helper to clean percentages
-    def p2f(x): return float(str(x).replace('%','')) / 100.0 if '%' in str(x) else float(x)
+    # Use position rather than name to avoid KeyError
+    # Col 0: State, Col 1: Pop Share, Col 2: Age Pct, Col 3: Adoption
+    states_list = df_demo.iloc[:, 0].tolist()
+    selected_state = st.sidebar.selectbox("Select Target State", states_list)
     
-    pop_share = p2f(s_row['Pop_Share_Pct'])
-    age_pct = p2f(s_row['Addressable_Age_Pct'])
-    adopt_pct = p2f(s_row['AI_Adoption_Pct'])
-    c_pct, t_pct, cr_pct, a_pct = p2f(s_row['Casual_Pct']), p2f(s_row['Thinker_Pct']), p2f(s_row['Creator_Pct']), p2f(s_row['Architect_Pct'])
-else:
-    # Hard fallback numbers
-    pop_share, age_pct, adopt_pct = 0.03, 0.75, 0.50
-    c_pct, t_pct, cr_pct, a_pct = 0.60, 0.20, 0.10, 0.10
+    s_row = df_demo[df_demo.iloc[:, 0] == selected_state].iloc[0]
+    
+    def clean_val(val):
+        try:
+            return float(str(val).replace('%','').strip()) / 100.0 if '%' in str(val) else float(val)
+        except: return 0.0
 
-adoption_rate = st.sidebar.slider("AI Adoption Rate", 0.1, 1.0, adopt_pct)
+    pop_share = clean_val(s_row.iloc[1])
+    age_pct   = clean_val(s_row.iloc[2])
+    adopt_val = clean_val(s_row.iloc[3])
+else:
+    st.sidebar.warning("Using built-in demo data.")
+    selected_state = "New Jersey (Demo)"
+    pop_share, age_pct, adopt_val = 0.028, 0.75, 0.50
+
+adoption_rate = st.sidebar.slider("AI Adoption Rate", 0.1, 1.0, adopt_val)
 active_users = TOTAL_US_POP * pop_share * age_pct * adoption_rate
 
-st.sidebar.markdown(f"**Target Users:** {active_users:,.0f}")
+st.sidebar.metric("Target AI Users", f"{active_users:,.0f}")
 
-# --- 4. GRID & CHART ---
+# --- 4. CALCULATIONS & CHART ---
 # Standard hourly curve
 curve = np.array([0.05, 0.02, 0.01, 0.01, 0.02, 0.05, 0.15, 0.40, 0.70, 0.90, 1.00, 1.00, 0.95, 0.90, 0.95, 0.90, 0.80, 0.75, 0.80, 0.85, 0.90, 0.60, 0.30, 0.10])
 curve = curve / np.sum(curve)
 
-# Simplified Demand Math for stability
-daily_mwh = (active_users * 15 * 1.15) / 1_000_000 # Average 15Wh per user/day
+# Average 15Wh per user/day baseline
+daily_mwh = (active_users * 15 * 1.15) / 1_000_000 
 hourly_ai_mw = daily_mwh * curve
-
-# Mock Grid (Pulled from logic in previous steps)
 grid_base = np.array([78000, 76000, 75000, 74500, 75000, 77000, 81000, 85000, 88000, 89000, 90000, 91000, 91500, 91000, 90500, 90000, 91000, 93000, 95000, 94000, 91000, 88000, 84000, 80000])
 
 col1, col2 = st.columns([2, 1])
@@ -112,14 +89,17 @@ with col1:
 
 with col2:
     st.metric("Peak AI Demand", f"{hourly_ai_mw.max():,.0f} MW")
-    st.metric("Daily Energy Consumed", f"{daily_mwh:,.0f} MWh")
+    st.metric("Daily Energy", f"{daily_mwh:,.0f} MWh")
     st.metric("Grid Stress Increase", f"{(hourly_ai_mw.max()/grid_base.max()*100):.2f}%")
 
 # --- 5. INFRASTRUCTURE TABLE ---
-st.subheader("Infrastructure Deployment Requirements")
+st.subheader("Infrastructure Requirements")
 infra_data = [
-    {"Tech": "SMR (Nuclear)", "Capacity Needed": hourly_ai_mw.max() * 1.05, "Cost ($B)": (hourly_ai_mw.max() * 8.0) / 1000},
-    {"Tech": "Natural Gas", "Capacity Needed": hourly_ai_mw.max() * 1.10, "Cost ($B)": (hourly_ai_mw.max() * 1.2) / 1000},
-    {"Tech": "Solar + Storage", "Capacity Needed": hourly_ai_mw.max() * 3.50, "Cost ($B)": (hourly_ai_mw.max() * 2.5) / 1000}
+    {"Power Source": "SMR (Nuclear)", "Capacity Needed (MW)": f"{hourly_ai_mw.max() * 1.05:,.0f}", "Est. Cost ($B)": f"${(hourly_ai_mw.max() * 8.0) / 1000:,.2f}"},
+    {"Power Source": "Natural Gas", "Capacity Needed (MW)": f"{hourly_ai_mw.max() * 1.10:,.0f}", "Est. Cost ($B)": f"${(hourly_ai_mw.max() * 1.2) / 1000:,.2f}"},
+    {"Power Source": "Solar + Storage", "Capacity Needed (MW)": f"{hourly_ai_mw.max() * 3.50:,.0f}", "Est. Cost ($B)": f"${(hourly_ai_mw.max() * 2.5) / 1000:,.2f}"}
 ]
-st.table(pd.DataFrame(infra_data))
+st.table(infra_data)
+
+if st.sidebar.checkbox("Show Raw Data Debugger"):
+    st.write("Demographics Table (Extracted):", df_demo)
