@@ -18,58 +18,74 @@ EIA_API_KEY = "egUujavB2YGwnp3NE2Wa6qgJzLzHkWPJXVEZ3FDn"
 def load_master_log(sheet_id):
     # Fetch the flat CSV from the single sheet
     base_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv"
-    raw_df = pd.read_csv(base_url, header=None, names=list(range(10)))
+    raw_df = pd.read_csv(base_url, header=None)
     
-    # Parse the single sheet into our distinct DataFrames based on the "TAB:" markers
-    tab_indices = raw_df[raw_df[0].astype(str).str.startswith("TAB:")].index.tolist()
-    tab_indices.append(len(raw_df))
-    
-    dataframes = {}
-    for i in range(len(tab_indices) - 1):
-        start_idx = tab_indices[i]
-        end_idx = tab_indices[i+1]
-        tab_name = str(raw_df.iloc[start_idx, 0]).replace("TAB:", "").strip()
+    def extract_by_header(col0_name):
+        # Scan the first column for the exact header we need
+        matches = raw_df[raw_df[0].astype(str).str.strip() == col0_name]
+        if matches.empty:
+            return pd.DataFrame() # Return empty if not found
         
-        # Extract the chunk and set the headers
-        chunk = raw_df.iloc[start_idx+1 : end_idx].dropna(how='all')
-        if not chunk.empty:
-            # Force all column names to strings and strip away invisible spaces
-            chunk.columns = chunk.iloc[0].astype(str).str.strip()
-            chunk = chunk[1:].dropna(axis=1, how='all').reset_index(drop=True)
-            dataframes[tab_name] = chunk
-            
-    # Assign the parsed chunks
-    df_demo = dataframes.get("State_Demographics", pd.DataFrame())
-    df_tech = dataframes.get("Tech_Costs_LCOE_2026", pd.DataFrame())
-    df_benchmarks = dataframes.get("AI_Demand_Benchmarks", pd.DataFrame())
-    df_globals = dataframes.get("Global_Variables", pd.DataFrame())
+        start_idx = matches.index[0]
+        table_rows = [raw_df.iloc[start_idx].values] # Grab the header row
+        
+        # Grab all rows below the header until we hit a blank space or a new section
+        for i in range(start_idx + 1, len(raw_df)):
+            val = str(raw_df.iloc[i, 0]).strip()
+            if val == '' or val.lower() == 'nan' or val.startswith('TAB:'):
+                break
+            table_rows.append(raw_df.iloc[i].values)
+        
+        # Convert to DataFrame and clean up
+        df = pd.DataFrame(table_rows)
+        df.columns = df.iloc[0].astype(str).str.strip() # Set headers
+        df = df[1:].reset_index(drop=True) # Drop the header row from the data
+        return df
+
+    # Dynamically hunt down the specific tables
+    df_demo = extract_by_header('State')
+    df_tech = extract_by_header('Technology')
+    df_benchmarks = extract_by_header('Archetype')
+    df_globals = extract_by_header('Variable_Name')
     
-    # Clean the demographic percentages
+    # Clean the demographic percentages safely
     for col in ['Pop_Share_Pct', 'Addressable_Age_Pct', 'AI_Adoption_Pct', 'Casual_Pct', 'Thinker_Pct', 'Creator_Pct', 'Architect_Pct']:
         if col in df_demo.columns:
-            df_demo[col] = df_demo[col].astype(str).str.rstrip('%').astype('float') / 100.0
+            df_demo[col] = df_demo[col].astype(str).str.replace('%', '', regex=False).astype(float) / 100.0
             
-    # Convert benchmark numbers
+    # Convert benchmark numbers safely
     for col in ['Tasks_Per_Day', 'Energy_Per_Task_Wh', 'Cooling_Tax_PUE']:
         if col in df_benchmarks.columns:
-            df_benchmarks[col] = df_benchmarks[col].astype(float)
+            df_benchmarks[col] = pd.to_numeric(df_benchmarks[col], errors='coerce')
             
-    # Convert tech cost numbers
+    # Convert tech cost numbers safely
     for col in ['LCOE_USD_per_MWh', 'Est_CAPEX_per_MW', 'Nameplate_Multiplier']:
         if col in df_tech.columns:
-            df_tech[col] = df_tech[col].astype(float)
+            df_tech[col] = pd.to_numeric(df_tech[col], errors='coerce')
             
     return df_demo, df_tech, df_benchmarks, df_globals
 
 try:
     df_demo, df_tech, df_benchmarks, df_globals = load_master_log(SHEET_ID)
 except Exception as e:
-    st.error(f"Could not parse the Google Sheet. Please check link sharing settings. Error: {e}")
+    st.error(f"Error fetching data. Error: {e}")
     st.stop()
 
-# Extract Global Variables
-TOTAL_US_POP = float(df_globals.loc[df_globals['Variable_Name'] == 'Total_US_Internet_Pop', 'Value'].values[0])
-SOCIAL_CARBON_COST = float(df_globals.loc[df_globals['Variable_Name'] == 'Social_Cost_Carbon', 'Value'].values[0])
+# Safety Check
+if df_demo.empty:
+    st.error("Could not parse State Demographics from the Master Log. Please check the Google Sheet.")
+    st.stop()
+
+# Extract Global Variables safely with fallbacks so the app never crashes
+try:
+    TOTAL_US_POP = float(df_globals.loc[df_globals['Variable_Name'] == 'Total_US_Internet_Pop', 'Value'].values[0])
+except:
+    TOTAL_US_POP = 330000000.0
+
+try:
+    SOCIAL_CARBON_COST = float(df_globals.loc[df_globals['Variable_Name'] == 'Social_Cost_Carbon', 'Value'].values[0])
+except:
+    SOCIAL_CARBON_COST = 200.0
 
 # --- 2. SIDEBAR: STATE SELECTION & DEMOGRAPHICS ---
 st.sidebar.header("1. Geographic Simulation")
@@ -92,7 +108,6 @@ adoption_rate = st.sidebar.slider(
 )
 
 active_ai_users = addressable_pop * adoption_rate
-
 st.sidebar.markdown(f"**Total AI Users Simulated:** {active_ai_users:,.0f}")
 
 with st.sidebar.expander("User Archetype Mix (State Default)"):
@@ -103,11 +118,15 @@ with st.sidebar.expander("User Archetype Mix (State Default)"):
 
 # --- 3. MATH ENGINE: LOAD CURVE CALCULATION ---
 # Map the Energy Benchmarks from the sheet
-energy_costs = {
-    row['Archetype'].split()[0]: row['Energy_Per_Task_Wh'] * row['Tasks_Per_Day'] 
-    for _, row in df_benchmarks.iterrows()
-}
-pue_tax = df_benchmarks['Cooling_Tax_PUE'].iloc[0]
+try:
+    energy_costs = {
+        str(row['Archetype']).split()[0]: row['Energy_Per_Task_Wh'] * row['Tasks_Per_Day'] 
+        for _, row in df_benchmarks.iterrows()
+    }
+    pue_tax = float(df_benchmarks['Cooling_Tax_PUE'].iloc[0])
+except:
+    energy_costs = {'Casual': 3.0, 'Thinker': 25.0, 'Creator': 300.0, 'Architect': 75.0}
+    pue_tax = 1.15
 
 # Standard 24-hour distribution curve
 base_activity_curve = np.array([
@@ -133,27 +152,24 @@ peak_ai_mw = daily_mw_load.max()
 total_daily_mwh = daily_mw_load.sum()
 
 # --- 4. LIVE GRID INTEGRATION (EIA API) ---
-# Map states to their regional Balancing Authority
 ba_mapping = {
     'California': 'CISO', 'Texas': 'ERCO', 'Florida': 'FPL',
     'New York': 'NYIS', 'Pennsylvania': 'PJM', 'Illinois': 'MISO',
     'Ohio': 'PJM', 'Georgia': 'SOCO', 'North Carolina': 'DUK',
     'Michigan': 'MISO', 'Massachusetts': 'ISNE', 'New Jersey': 'PJM'
 }
-region_code = ba_mapping.get(selected_state, 'PJM') # Defaults to Mid-Atlantic PJM
+region_code = ba_mapping.get(selected_state, 'PJM')
 
-@st.cache_data(ttl=3600) # Cache API calls for 1 hour to save quota
+@st.cache_data(ttl=3600)
 def fetch_eia_grid_data(api_key, region):
     url = f"https://api.eia.gov/v2/electricity/rto/region-data/data/?api_key={api_key}&frequency=hourly&data[0]=value&facets[respondent][]={region}&sort[0][column]=period&sort[0][direction]=desc&length=24"
     try:
         response = requests.get(url, timeout=10).json()
         values = [float(item['value']) for item in response['response']['data']]
         if len(values) == 24:
-            return values[::-1] # Reverse to chronological order
-    except Exception as e:
+            return values[::-1]
+    except:
         pass
-    
-    # Fallback mock data if API fails or times out
     return [78000, 76000, 75000, 74500, 75000, 77000, 81000, 85000, 88000, 89000,
             90000, 91000, 91500, 91000, 90500, 90000, 91000, 93000, 95000, 94000,
             91000, 88000, 84000, 80000]
@@ -193,37 +209,39 @@ results = []
 annual_mwh = total_daily_mwh * 365
 
 for _, row in df_tech.iterrows():
-    tech_name = row['Technology']
-    
-    # Hardcoding the environmental map for simplicity in this loop since it's on a separate sheet
-    carbon_rate = 0 if "Nuclear" in tech_name or "Solar" in tech_name else 430
-    water_rate = 600 if "Nuclear" in tech_name else (20 if "Solar" in tech_name else 250)
-    
-    annual_cost = annual_mwh * row['LCOE_USD_per_MWh']
-    annual_water = annual_mwh * water_rate
-    annual_carbon_tons = (annual_mwh * carbon_rate) / 1000
-    social_cost = annual_carbon_tons * SOCIAL_CARBON_COST
-    installed_mw_needed = peak_ai_mw * row['Nameplate_Multiplier']
-    est_capex = installed_mw_needed * row['Est_CAPEX_per_MW']
-    
-    results.append({
-        "Power Source": tech_name,
-        "Req. Capacity (MW)": installed_mw_needed,
-        "Est. CAPEX ($B)": est_capex / 1_000_000_000,
-        "Direct Energy Cost ($M)": annual_cost / 1_000_000,
-        "Social Carbon Cost ($M)": social_cost / 1_000_000,
-        "Total Societal Cost ($M)": (annual_cost + social_cost) / 1_000_000,
-        "Water Usage (M Gallons)": annual_water / 1_000_000
-    })
+    try:
+        tech_name = row['Technology']
+        carbon_rate = 0 if "Nuclear" in tech_name or "Solar" in tech_name else 430
+        water_rate = 600 if "Nuclear" in tech_name else (20 if "Solar" in tech_name else 250)
+        
+        annual_cost = annual_mwh * row['LCOE_USD_per_MWh']
+        annual_water = annual_mwh * water_rate
+        annual_carbon_tons = (annual_mwh * carbon_rate) / 1000
+        social_cost = annual_carbon_tons * SOCIAL_CARBON_COST
+        installed_mw_needed = peak_ai_mw * row['Nameplate_Multiplier']
+        est_capex = installed_mw_needed * row['Est_CAPEX_per_MW']
+        
+        results.append({
+            "Power Source": tech_name,
+            "Req. Capacity (MW)": installed_mw_needed,
+            "Est. CAPEX ($B)": est_capex / 1_000_000_000,
+            "Direct Energy Cost ($M)": annual_cost / 1_000_000,
+            "Social Carbon Cost ($M)": social_cost / 1_000_000,
+            "Total Societal Cost ($M)": (annual_cost + social_cost) / 1_000_000,
+            "Water Usage (M Gallons)": annual_water / 1_000_000
+        })
+    except:
+        pass # Skip row if data is corrupted
 
-st.dataframe(
-    pd.DataFrame(results).style.format({
-        "Req. Capacity (MW)": "{:,.0f}",
-        "Est. CAPEX ($B)": "${:,.2f}",
-        "Direct Energy Cost ($M)": "${:,.1f}",
-        "Social Carbon Cost ($M)": "${:,.1f}",
-        "Total Societal Cost ($M)": "${:,.1f}",
-        "Water Usage (M Gallons)": "{:,.1f}"
-    }),
-    use_container_width=True
-)
+if results:
+    st.dataframe(
+        pd.DataFrame(results).style.format({
+            "Req. Capacity (MW)": "{:,.0f}",
+            "Est. CAPEX ($B)": "${:,.2f}",
+            "Direct Energy Cost ($M)": "${:,.1f}",
+            "Social Carbon Cost ($M)": "${:,.1f}",
+            "Total Societal Cost ($M)": "${:,.1f}",
+            "Water Usage (M Gallons)": "{:,.1f}"
+        }),
+        use_container_width=True
+    )
