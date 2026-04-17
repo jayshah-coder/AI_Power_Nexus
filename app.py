@@ -47,88 +47,86 @@ total_us_pop = 340_000_000
 adoption_rate = st.sidebar.slider("AI Adoption Rate (2030)", 0.1, 1.0, 0.85)
 state_users = total_us_pop * pop_share * age_pct * adoption_rate
 
-# --- 3. SIDEBAR: ARCHETYPE DESCRIPTIONS & MIX ---
+# --- 3. SIDEBAR: ARCHETYPE MIX ---
 st.sidebar.header("2. Archetype Mix (%)")
-with st.sidebar.expander("ℹ️ About Archetypes & Peak Timing"):
-    st.markdown("""
-    **The Searcher (Baseline):** - *What:* Quick, text-based info retrieval.
-    - *Energy:* Low (~0.3 Wh).
-    - *Timing:* Peaks during mid-day working hours.
-    
-    **The Thinker (Reasoning):** - *What:* Complex logic, coding, and multi-step reasoning.
-    - *Energy:* Medium (~15 Wh).
-    - *Timing:* Peaks during morning and afternoon 'Deep Work' blocks.
-    
-    **The Creator (Video/Agent):** - *What:* High-res video gen and autonomous digital agents.
-    - *Energy:* Very High (~100 Wh).
-    - *Timing:* Peaks in late evening 'Creative' sessions.
-    """)
 
 # Fixed logic to prevent negative remainders
-thinker_pct = st.sidebar.slider("The Thinker (Reasoning) %", 0, 100, 25)
-# Creator pct is capped at what is left over from Thinker
-creator_pct = st.sidebar.slider("The Creator (Video/Agent) %", 0, (100 - thinker_pct), 15)
+thinker_pct = st.sidebar.slider("The Thinker (Reasoning) %", 0, 100, 25, help="Complex logic & coding. Peaks 9AM-5PM.")
+creator_pct = st.sidebar.slider("The Creator (Video/Agent) %", 0, (100 - thinker_pct), 15, help="High-res generation. Peaks 6PM-11PM.")
 searcher_pct = 100 - (thinker_pct + creator_pct)
 
 st.sidebar.info(f"The Searcher (Baseline): {searcher_pct}% (Remainder)")
 
 # --- 4. SIDEBAR: USAGE INTENSITY ---
 st.sidebar.header("3. Query Volume (Queries/Day)")
-st.sidebar.caption("Typical values provided as defaults.")
 q_searcher = st.sidebar.slider("Searcher Daily Volume", 1, 300, 80)
 q_thinker = st.sidebar.slider("Thinker Daily Volume", 1, 200, 40)
 q_creator = st.sidebar.slider("Creator Daily Volume", 1, 100, 15)
 
-# 2030 Constants
-WH_SEARCHER, WH_THINKER, WH_CREATOR = 0.3, 15.0, 100.0
-PUE_2030 = 1.12 
-
+# --- 5. SIDEBAR: INFRASTRUCTURE BASELOAD ---
 st.sidebar.header("4. Infrastructure Baseload")
-with st.sidebar.expander("ℹ️ What is Training Baseload?"):
-    st.markdown("""
-    **Model Training Clusters** run 24/7. Unlike user queries (Inference) which drop off when people sleep, 
-    Training is a constant 'brick' of power. This is why utilities must build 'Always-On' plants (Nuclear/Gas).
-    """)
-training_baseload = st.sidebar.number_input("State Training Baseload (MW)", 0, 10000, 1200)
+# Logic: Suggest baseload based on state tier
+high_tier = ['Virginia', 'Texas', 'California', 'Ohio']
+suggested_mw = 3500 if selected_state in high_tier else 1200
 
-# --- 5. CALCULATIONS ---
+training_baseload = st.sidebar.number_input(
+    "State Training Baseload (MW)", 
+    0, 15000, suggested_mw,
+    help=f"Suggested for {selected_state}: {suggested_mw} MW based on estimated 2030 data center clusters."
+)
+
+# --- 6. CALCULATIONS & MULTI-CURVE LOGIC ---
+# Define specific shapes for each archetype
+def get_curve(peak_hour, spread):
+    x = np.arange(24)
+    c = np.exp(-0.5 * ((x - peak_hour) / spread) ** 2)
+    return c / np.sum(c)
+
+# Searcher: Standard work-day bell curve
+curve_search = get_curve(13, 4) 
+# Thinker: Twin peaks (morning deep work & afternoon sprint)
+curve_think = (get_curve(10, 2) + get_curve(15, 2)) / 2
+# Creator: Heavy evening/late night skew
+curve_create = get_curve(20, 3) 
+
+# Segment users
 u_searcher = state_users * (searcher_pct / 100.0)
 u_thinker  = state_users * (thinker_pct / 100.0)
 u_creator  = state_users * (creator_pct / 100.0)
 
-mwh_searcher = (u_searcher * q_searcher * WH_SEARCHER * PUE_2030) / 1_000_000
-mwh_thinker  = (u_thinker * q_thinker * WH_THINKER * PUE_2030) / 1_000_000
-mwh_creator  = (u_creator * q_creator * WH_CREATOR * PUE_2030) / 1_000_000
+# Daily MWh
+mwh_searcher = (u_searcher * q_searcher * 0.3 * 1.12) / 1_000_000
+mwh_thinker  = (u_thinker * q_thinker * 15.0 * 1.12) / 1_000_000
+mwh_creator  = (u_creator * q_creator * 100.0 * 1.12) / 1_000_000
 
-# Hourly distribution: Training is flat, Inference follows a human cycle
-inference_curve = np.array([0.05, 0.02, 0.01, 0.01, 0.02, 0.05, 0.15, 0.40, 0.70, 0.90, 1.00, 1.05, 1.10, 1.05, 1.10, 1.15, 1.20, 1.30, 1.40, 1.35, 1.20, 0.90, 0.50, 0.20])
-inference_curve = inference_curve / np.sum(inference_curve)
+# Hourly AI MW (Blended)
+hourly_ai_mw = (mwh_searcher * curve_search) + (mwh_thinker * curve_think) + (mwh_creator * curve_create) + training_baseload
 
-hourly_ai_mw = (mwh_searcher + mwh_thinker + mwh_creator) * inference_curve + training_baseload
+# Simulated 2030 Summer Peak Grid
 grid_base = np.array([72000, 70000, 68000, 67500, 69000, 73000, 78000, 84000, 89000, 93000, 97000, 101000, 105000, 108000, 110500, 112000, 113000, 111000, 106000, 99000, 93000, 86000, 80000, 75000])
 
-# --- 6. VISUALIZATION ---
+# --- 7. VISUALIZATION ---
 col1, col2 = st.columns([2, 1])
 
 with col1:
     st.subheader(f"2030 Summer Peak Simulation: {selected_state}")
     fig = go.Figure()
     fig.add_trace(go.Scatter(y=grid_base, name="Base Grid (Summer Heat)", stackgroup='one', fillcolor='rgba(131, 192, 238, 0.4)', line=dict(width=0)))
-    fig.add_trace(go.Scatter(y=hourly_ai_mw, name="AI Load (Training + Inference)", stackgroup='one', fillcolor='rgba(255, 99, 71, 0.8)', line=dict(width=0)))
-    fig.update_layout(yaxis_title="Megawatts (MW)", xaxis_title="Hour of Day", hovermode="x unified", template="plotly_white")
+    fig.add_trace(go.Scatter(y=hourly_ai_mw, name="AI Load (Training + Dynamic Inference)", stackgroup='one', fillcolor='rgba(255, 99, 71, 0.8)', line=dict(width=0)))
+    fig.update_layout(yaxis_title="Megawatts (MW)", xaxis_title="Hour (0-23)", hovermode="x unified", template="plotly_white")
     st.plotly_chart(fig, use_container_width=True)
 
 with col2:
     st.markdown("### Grid Impact Metrics")
     st.metric("Peak AI Demand", f"{hourly_ai_mw.max():,.0f} MW")
-    st.metric("Daily Energy Usage", f"{(hourly_ai_mw.sum()):,.0f} MWh")
+    st.metric("Total Daily Energy", f"{(hourly_ai_mw.sum()):,.0f} MWh")
     st.metric("Grid Stress Increase", f"{(hourly_ai_mw.max() / grid_base.max() * 100):.2f}%")
     
     with st.expander("MWh Share by Segment"):
         st.write(f"Search: {mwh_searcher:,.0f} | Think: {mwh_thinker:,.0f} | Create: {mwh_creator:,.0f}")
         st.write(f"Training Baseload: {training_baseload * 24:,.0f} MWh")
 
-# --- 7. INFRASTRUCTURE TABLE ---
+# --- 8. INFRASTRUCTURE & SOURCES ---
 st.subheader("2030 Asset Deployment Requirements")
 infra_df = pd.DataFrame([
     {"Power Source": "Small Modular Reactors (SMR)", "Capacity (MW)": f"{hourly_ai_mw.max() * 1.05:,.0f}", "Est. Cost ($B)": f"${(hourly_ai_mw.max() * 8.5) / 1000:,.2f}"},
@@ -136,3 +134,14 @@ infra_df = pd.DataFrame([
     {"Power Source": "Solar + 8hr Battery Storage", "Capacity (MW)": f"{hourly_ai_mw.max() * 4.5:,.0f}", "Est. Cost ($B)": f"${(hourly_ai_mw.max() * 3.2) / 1000:,.2f}"}
 ])
 st.table(infra_df)
+
+with st.expander("📚 Data Sources & Methodology"):
+    st.markdown("""
+    - **Base Grid Loads:** U.S. Energy Information Administration (EIA) Hourly Grid Monitor (Historical Peak Projections).
+    - **Energy Benchmarks:** EPRI 'Powering Intelligence' 2024 Load Growth Study.
+    - **Cost Estimates:** NREL Annual Technology Baseline (ATB) 2024 (LCOE & CAPEX).
+    - **Archetype Models:** Built using inference-time compute projections for frontier reasoning models (2025-2030).
+    """)
+
+st.markdown("---")
+st.markdown("<div style='text-align: center; color: gray; font-size: 0.8em;'>Developed by J. M. Shah</div>", unsafe_allow_html=True)
