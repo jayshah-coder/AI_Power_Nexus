@@ -73,6 +73,7 @@ st.sidebar.info(f"The Searcher (Baseline): {searcher_pct}% (Remainder)")
 
 # --- 4. SIDEBAR: USAGE INTENSITY ---
 st.sidebar.header("3. Query Volume (Queries/Day)")
+st.sidebar.caption("Typical values provided as defaults.")
 q_searcher = st.sidebar.slider("Searcher Daily Volume", 1, 300, 80)
 q_thinker = st.sidebar.slider("Thinker Daily Volume", 1, 200, 40)
 q_creator = st.sidebar.slider("Creator Daily Volume", 1, 100, 15)
@@ -98,10 +99,13 @@ u_searcher = state_users * (searcher_pct / 100.0)
 u_thinker  = state_users * (thinker_pct / 100.0)
 u_creator  = state_users * (creator_pct / 100.0)
 
-# Energy usage
-mwh_searcher = (u_searcher * q_searcher * 0.3 * 1.12) / 1_000_000
-mwh_thinker  = (u_thinker * q_thinker * 15.0 * 1.12) / 1_000_000
-mwh_creator  = (u_creator * q_creator * 100.0 * 1.12) / 1_000_000
+# Energy usage constants (Wh)
+WH_S, WH_T, WH_C = 0.3, 15.0, 100.0
+PUE_VAL = 1.12
+
+mwh_searcher = (u_searcher * q_searcher * WH_S * PUE_VAL) / 1_000_000
+mwh_thinker  = (u_thinker * q_thinker * WH_T * PUE_VAL) / 1_000_000
+mwh_creator  = (u_creator * q_creator * WH_C * PUE_VAL) / 1_000_000
 
 hourly_ai_mw = (mwh_searcher * curve_search) + (mwh_thinker * curve_think) + (mwh_creator * curve_create) + training_baseload
 grid_base = np.array([72000, 70000, 68000, 67500, 69000, 73000, 78000, 84000, 89000, 93000, 97000, 101000, 105000, 108000, 110500, 112000, 113000, 111000, 106000, 99000, 93000, 86000, 80000, 75000])
@@ -116,4 +120,53 @@ if peak_hour_ai >= 18 or peak_hour_ai <= 6:
     solar_label = "Solar + Storage (Evening Peak)"
 else:
     storage_multiplier = 1.0
-    solar_label = "
+    solar_label = "Solar + Storage (Daytime Peak)"
+
+infra_options = [
+    {"Option": "Modular Nuclear (SMR)", "Capacity (MW)": hourly_ai_mw.max()*1.05, "CAPEX ($B)": (hourly_ai_mw.max()*8.5)/1000, "Carbon Cost ($M/yr)": 0},
+    {"Option": "Natural Gas (CCGT)", "Capacity (MW)": hourly_ai_mw.max()*1.10, "CAPEX ($B)": (hourly_ai_mw.max()*1.4)/1000, "Carbon Cost ($M/yr)": (total_daily_energy*365*0.430*social_carbon_tax)/1_000_000},
+    {"Option": solar_label, "Capacity (MW)": hourly_ai_mw.max()*4.5, "CAPEX ($B)": (hourly_ai_mw.max()*3.2*storage_multiplier)/1000, "Carbon Cost ($M/yr)": 0}
+]
+
+# --- 8. VISUALIZATION ---
+col1, col2 = st.columns([2, 1])
+
+with col1:
+    st.subheader(f"2030 Summer Peak Simulation: {selected_state}")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(y=grid_base, name="Base Grid Load", stackgroup='one', fillcolor='rgba(131, 192, 238, 0.4)', line=dict(width=0)))
+    fig.add_trace(go.Scatter(y=hourly_ai_mw, name="AI System Load", stackgroup='one', fillcolor='rgba(255, 99, 71, 0.8)', line=dict(width=0)))
+    fig.update_layout(yaxis_title="MW", xaxis_title="Hour", hovermode="x unified", template="plotly_white")
+    st.plotly_chart(fig, use_container_width=True)
+
+with col2:
+    st.markdown("### Grid Impact Metrics")
+    st.metric("Peak AI Demand", f"{hourly_ai_mw.max():,.0f} MW")
+    st.metric("Total Daily Energy", f"{total_daily_energy:,.0f} MWh")
+    st.metric("Grid Stress Increase", f"{(hourly_ai_mw.max() / grid_base.max() * 100):.2f}%")
+    
+    st.markdown("---")
+    st.markdown("### 2030 User Breakdown")
+    st.write(f"**Total AI Users:** {state_users:,.0f}")
+    
+    pop_df = pd.DataFrame([
+        {"Archetype": "Searchers", "Count": f"{u_searcher:,.0f}", "%": f"{searcher_pct:.1f}%"},
+        {"Archetype": "Thinkers", "Count": f"{u_thinker:,.0f}", "%": f"{thinker_pct:.1f}%"},
+        {"Archetype": "Creators", "Count": f"{u_creator:,.0f}", "%": f"{creator_pct:.1f}%"}
+    ])
+    st.table(pop_df)
+
+st.subheader("Infrastructure Pathways (Mutually Exclusive Options)")
+st.markdown("*Select one independent technology strategy to firm the incremental AI load.*")
+st.table(pd.DataFrame(infra_options).style.format({"Capacity (MW)": "{:,.0f}", "CAPEX ($B)": "${:,.2f}", "Carbon Cost ($M/yr)": "${:,.1f}"}))
+
+with st.expander("📚 Data Sources & Methodology"):
+    st.markdown("""
+    - **Base Grid:** EIA Hourly Grid Monitor projections for 2030 summer peaks.
+    - **Energy Benchmarks:** EPRI 'Powering Intelligence' 2024 scaling models.
+    - **Infrastructure Costs:** NREL Annual Technology Baseline (ATB) 2024.
+    - **Carbon Logic:** EPA 2030 Social Cost of Carbon ($200/metric ton).
+    """)
+
+st.markdown("---")
+st.markdown("<div style='text-align: center; color: gray; font-size: 0.8em;'>Created by Jay Shah</div>", unsafe_allow_html=True)
