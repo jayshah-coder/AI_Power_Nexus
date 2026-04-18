@@ -7,43 +7,38 @@ import plotly.graph_objects as go
 st.set_page_config(page_title="2030 AI Power Nexus", layout="wide")
 st.title("AI Power Nexus: 2030 Summer Peak Simulation")
 
-# --- 1. DATA CONNECTIONS (MASTER LOG V4) ---
+# --- 1. DATA CONNECTIONS ---
+# IMPORTANT: If your data is on different TABS, move the Technology/Global data to the FIRST tab 
+# or ensure the header markers (e.g., 'Technology') are unique and visible on the main sheet.
 SHEET_ID = "1oRgI3uZP8WINBRU6GfybW0K8BUvoz2YHXuQ0Y02QLCY"
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=60) # Reduced TTL for faster debugging
 def load_master_log(sheet_id):
     base_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv"
     try:
         raw_df = pd.read_csv(base_url, header=None)
     except Exception as e:
-        st.error(f"Failed to connect to spreadsheet: {e}")
-        st.stop()
+        st.error(f"Spreadsheet Connection Error: {e}")
+        return None, None, None, None
     
-    def extract_table(header_marker):
-        # 1. Find the marker row
-        marker_idx = None
-        for i, val in enumerate(raw_df[0].astype(str).str.strip()):
-            if val.lower() == header_marker.lower():
-                marker_idx = i
-                break
-        if marker_idx is None: return pd.DataFrame()
+    def extract_table(marker):
+        # Scan first column for the marker
+        idx = raw_df[raw_df[0].astype(str).str.strip().str.lower() == marker.lower()].index
+        if idx.empty: return pd.DataFrame()
         
-        # 2. Find the actual header row (skip titles/empty rows)
-        header_idx = marker_idx
-        while header_idx < len(raw_df):
-            if raw_df.iloc[header_idx].notna().sum() >= 2:
-                break
-            header_idx += 1
-        if header_idx >= len(raw_df): return pd.DataFrame()
+        start = idx[0]
+        # Skip empty rows or title rows to find the header
+        while start < len(raw_df) and raw_df.iloc[start].isna().sum() > (len(raw_df.columns) - 2):
+            start += 1
             
-        # 3. Collect data until a break
         rows = []
-        for i in range(header_idx, len(raw_df)):
-            first_val = str(raw_df.iloc[i, 0]).strip().lower()
-            if i > header_idx and (first_val == '' or first_val == 'nan' or first_val.startswith('tab:')):
+        for i in range(start, len(raw_df)):
+            val = str(raw_df.iloc[i, 0]).strip().lower()
+            if i > start and (val == '' or val == 'nan' or val.startswith('tab:')):
                 break
             rows.append(raw_df.iloc[i].values)
-        
+            
+        if not rows: return pd.DataFrame()
         df = pd.DataFrame(rows)
         df.columns = df.iloc[0].astype(str).str.strip()
         return df[1:].reset_index(drop=True)
@@ -53,16 +48,16 @@ def load_master_log(sheet_id):
 
 df_demo, df_globals, df_tech, df_bench = load_master_log(SHEET_ID)
 
-# --- 2. GLOBAL VARIABLE EXTRACTION ---
-def to_num(df, row_name):
+# --- 2. GLOBAL CONSTANTS ---
+def get_global(name, default):
+    if df_globals.empty: return default
     try:
-        mask = df.iloc[:, 0].astype(str).str.contains(row_name, na=False, case=False)
-        val = df[mask].iloc[0, 1]
-        return float(str(val).replace(',', '').replace('$', '').replace('%',''))
-    except: return None
+        mask = df_globals.iloc[:, 0].astype(str).str.contains(name, case=False, na=False)
+        return float(str(df_globals[mask].iloc[0, 1]).replace('$','').replace(',','').replace('%',''))
+    except: return default
 
-US_POP_2030 = to_num(df_globals, 'Pop') or 340000000.0
-SOCIAL_CARBON_TAX = to_num(df_globals, 'Social') or 200.0
+US_POP = get_global('Pop', 340000000.0)
+CARBON_TAX = get_global('Social', 200.0)
 
 SUMMER_PEAK_MAP = {
     'Texas': 92400, 'California': 56100, 'Florida': 52800, 'New York': 33500,
@@ -71,10 +66,10 @@ SUMMER_PEAK_MAP = {
     'Michigan': 19800, 'Massachusetts': 14100
 }
 
-# --- 3. SIDEBAR: POPULATION & ADOPTION ---
-st.sidebar.header("1. 2030 Population & Adoption")
+# --- 3. SIDEBAR: ADOPTION & ARCHETYPES ---
+st.sidebar.header("1. Population & Adoption")
 if not df_demo.empty:
-    selected_state = st.sidebar.selectbox("Select Target State", df_demo.iloc[:, 0].tolist())
+    selected_state = st.sidebar.selectbox("Select State", df_demo.iloc[:, 0].tolist())
     s_row = df_demo[df_demo.iloc[:, 0] == selected_state].iloc[0]
     def p2f(v): 
         try: return float(str(v).replace('%','')) / 100.0 if '%' in str(v) else float(v)
@@ -83,40 +78,30 @@ if not df_demo.empty:
 else:
     selected_state, pop_share, age_pct = "New Jersey", 0.028, 0.75
 
-adoption_rate = st.sidebar.slider("AI Adoption Rate (2030)", 0.1, 1.0, 0.85)
-state_users = US_POP_2030 * pop_share * age_pct * adoption_rate
+adoption = st.sidebar.slider("AI Adoption Rate (2030)", 0.1, 1.0, 0.85)
+state_users = US_POP * pop_share * age_pct * adoption
 
-# --- 4. SIDEBAR: ARCHETYPE MIX ---
 st.sidebar.header("2. Archetype Mix (%)")
-with st.sidebar.expander("ℹ️ About Archetypes & Timing"):
-    st.markdown("""
-    - **Searcher:** Text retrieval (~0.3 Wh). Peaks mid-day.
-    - **Thinker:** Reasoning tasks (~15 Wh). Peaks 9AM-5PM.
-    - **Creator:** Video/Agents (~100 Wh). Peaks 6PM-11PM.
-    """)
-
-thinker_pct = st.sidebar.slider("The Thinker (Reasoning) %", 0, 100, 25)
+thinker_pct = st.sidebar.slider("The Thinker %", 0, 100, 25)
 creator_max = 100 - thinker_pct
-creator_pct = st.sidebar.slider("The Creator (Video) %", 0, creator_max, min(15, creator_max)) if creator_max > 0 else 0
+creator_pct = st.sidebar.slider("The Creator %", 0, creator_max, min(15, creator_max))
 searcher_pct = 100 - (thinker_pct + creator_pct)
-st.sidebar.info(f"The Searcher (Baseline): {searcher_pct}% (Remainder)")
+st.sidebar.info(f"The Searcher: {searcher_pct}% (Remainder)")
 
-# --- 5. SIDEBAR: INTENSITY & EFFICIENCY ---
-st.sidebar.header("3. Query Volume & Efficiency")
-q_searcher = st.sidebar.slider("Searcher Queries/Day", 1, 300, 80)
-q_thinker = st.sidebar.slider("Thinker Queries/Day", 1, 200, 40)
-q_creator = st.sidebar.slider("Creator Queries/Day", 1, 100, 15)
+st.sidebar.header("3. Intensity & Efficiency")
+q_s = st.sidebar.slider("Searcher Queries/Day", 1, 300, 80)
+q_t = st.sidebar.slider("Thinker Queries/Day", 1, 200, 40)
+q_c = st.sidebar.slider("Creator Queries/Day", 1, 100, 15)
+pue = st.sidebar.slider("Data Center PUE", 1.05, 1.5, 1.12)
+training = st.sidebar.number_input("Baseload (MW)", 0, 15000, 3500 if selected_state in ['Virginia', 'Texas', 'California'] else 1200)
 
-pue_slider = st.sidebar.slider("Data Center PUE", 1.05, 1.50, 1.12, help="Liquid cooling targets are ~1.05.")
-training_baseload = st.sidebar.number_input("State Training Baseload (MW)", 0, 15000, 3500 if selected_state in ['Virginia', 'Texas', 'California'] else 1200)
-
-# --- 6. GRID ENGINE ---
-def get_gaussian(peak_hour, spread):
+# --- 4. CALCS & SHAPES ---
+def get_shape(peak_hour, spread):
     x = np.arange(24)
     c = np.exp(-0.5 * ((x - peak_hour) / spread) ** 2)
     return c / np.sum(c)
 
-# State-Specific Grid Shapes
+# Regional Baselines
 if selected_state == 'California':
     base_shape = np.array([0.7, 0.65, 0.62, 0.6, 0.62, 0.68, 0.75, 0.7, 0.6, 0.5, 0.45, 0.48, 0.52, 0.6, 0.75, 0.9, 1.0, 0.98, 0.92, 0.85, 0.8, 0.78, 0.75, 0.72])
 elif selected_state in ['New York', 'Massachusetts', 'New Jersey']:
@@ -126,93 +111,76 @@ else:
 
 grid_base = base_shape * SUMMER_PEAK_MAP.get(selected_state, 20000)
 
-# Energy Calc (MW)
-u_s, u_t, u_c = state_users * (searcher_pct/100), state_users * (thinker_pct/100), state_users * (creator_pct/100)
-hourly_ai_mw = ( (u_s * q_searcher * 0.3 * pue_slider / 1e6) * get_gaussian(13, 4) +
-                 (u_t * q_thinker * 15.0 * pue_slider / 1e6) * get_gaussian(14, 3) +
-                 (u_c * q_creator * 100.0 * pue_slider / 1e6) * get_gaussian(21, 3) +
-                 training_baseload )
+# AI Load (MW)
+u_s_count, u_t_count, u_c_count = state_users * (searcher_pct/100), state_users * (thinker_pct/100), state_users * (creator_pct/100)
+hourly_ai_mw = ( (u_s_count * q_s * 0.3 * pue / 1e6) * get_shape(13, 4) +
+                 (u_t_count * q_t * 15.0 * pue / 1e6) * get_shape(14, 3) +
+                 (u_c_count * q_c * 100.0 * pue / 1e6) * get_shape(21, 3) +
+                 training )
 
-# --- 7. FUZZY TECHNOLOGY LOOKUP ---
-def get_tech_data(tech_name):
-    if df_tech is None or df_tech.empty: return 0.0, 1.0
+# --- 5. TECH LOOKUP ---
+def get_tech_data(name):
+    if df_tech.empty: return 0.0, 1.0
     try:
-        # 1. Find columns by keyword (Resilient to spelling/spaces)
-        cols = [str(c).lower().strip() for c in df_tech.columns]
-        capex_idx = next((i for i, c in enumerate(cols) if 'capex' in c), None)
-        mult_idx = next((i for i, c in enumerate(cols) if 'multiplier' in c or 'res' in c), None)
+        row = df_tech[df_tech.iloc[:,0].str.contains(name, case=False, na=False)].iloc[0]
+        # Robustly find CAPEX and Multiplier columns by keywords
+        capex_col = [c for c in df_tech.columns if 'capex' in c.lower()][0]
+        mult_col = [c for c in df_tech.columns if 'multi' in c.lower() or 'res' in c.lower()][0]
         
-        # 2. Find row by Technology name
-        mask = df_tech.iloc[:, 0].astype(str).str.contains(tech_name, na=False, case=False)
-        if not mask.any(): return 0.0, 1.0
-        row = df_tech[mask].iloc[0]
-        
-        # 3. Extract and clean values
-        capex = float(str(row.iloc[capex_idx]).replace('$','').replace(',','').strip()) if capex_idx is not None else 0.0
-        multiplier = 1.0
-        if mult_idx is not None:
-            mult_val = float(str(row.iloc[mult_idx]).replace('%','').strip())
-            multiplier = mult_val / 100.0 if mult_val > 10 else mult_val
-            
-        return capex, multiplier
+        cap = float(str(row[capex_col]).replace('$','').replace(',',''))
+        res = float(str(row[mult_col]).replace('%',''))
+        if res > 10: res /= 100.0
+        return cap, res
     except: return 0.0, 1.0
 
-peak_ai, daily_mwh_total = hourly_ai_mw.max(), hourly_ai_mw.sum()
-peak_hour = np.argmax(hourly_ai_mw)
+peak_ai, daily_mwh = hourly_ai_mw.max(), hourly_ai_mw.sum()
+peak_hr = np.argmax(hourly_ai_mw)
 
 smr_cap, smr_res = get_tech_data('Nuclear')
 gas_cap, gas_res = get_tech_data('Gas')
-solar_cap, _ = get_tech_data('Solar')
-# Evening storage multiplier
-solar_res = 5.5 if (peak_hour >= 18 or peak_hour <= 6) else 3.5
+sol_cap, _ = get_tech_data('Solar')
+sol_res = 5.5 if (peak_hr >= 18 or peak_hr <= 6) else 3.5
 
-infra_options = [
-    {"Pathway": "SMR (Nuclear)", "MW Needed": peak_ai * smr_res, "CAPEX ($B)": (peak_ai * smr_res * smr_cap) / 1e9, "Carbon ($M/yr)": 0},
-    {"Pathway": "Natural Gas", "MW Needed": peak_ai * gas_res, "CAPEX ($B)": (peak_ai * gas_res * gas_cap) / 1e9, "Carbon ($M/yr)": (daily_mwh_total * 365 * 0.430 * SOCIAL_CARBON_TAX) / 1e6},
-    {"Pathway": "Solar + Storage", "MW Needed": peak_ai * solar_res, "CAPEX ($B)": (peak_ai * solar_res * solar_cap) / 1e9, "Carbon ($M/yr)": 0}
+infra = [
+    {"Pathway": "SMR (Baseload)", "MW": peak_ai * smr_res, "CAPEX ($B)": (peak_ai * smr_res * smr_cap)/1e9, "Social Carbon ($M)": 0},
+    {"Pathway": "Natural Gas", "MW": peak_ai * gas_res, "CAPEX ($B)": (peak_ai * gas_res * gas_cap)/1e9, "Social Carbon ($M)": (daily_mwh * 365 * 0.43 * CARBON_TAX)/1e6},
+    {"Pathway": "Solar + Storage", "MW": peak_ai * sol_res, "CAPEX ($B)": (peak_ai * sol_res * sol_cap)/1e9, "Social Carbon ($M)": 0}
 ]
 
-# --- 8. UI RENDERING ---
-col1, col2 = st.columns([2, 1])
-with col1:
-    st.subheader(f"2030 Summer Peak: {selected_state}")
+# --- 6. RENDER ---
+c1, c2 = st.columns([2, 1])
+with c1:
+    st.subheader(f"2030 Peak Simulation: {selected_state}")
     fig = go.Figure()
     fig.add_trace(go.Scatter(y=grid_base, name="Base Grid", stackgroup='one', fillcolor='rgba(131, 192, 238, 0.4)', line=dict(width=0)))
     fig.add_trace(go.Scatter(y=hourly_ai_mw, name="AI System Load", stackgroup='one', fillcolor='rgba(255, 99, 71, 0.8)', line=dict(width=0)))
     fig.update_layout(yaxis_title="MW", xaxis_title="Hour", hovermode="x unified", template="plotly_white")
     st.plotly_chart(fig, use_container_width=True)
 
-with col2:
-    st.markdown("### Grid Impact Metrics")
+with c2:
+    st.markdown("### Grid Metrics")
     st.metric("Peak AI Demand", f"{peak_ai:,.0f} MW")
     st.metric("Grid Stress Increase", f"{(peak_ai / grid_base.max() * 100):.2f}%")
     st.markdown("---")
-    st.markdown("### 2030 User Breakdown")
     st.table(pd.DataFrame([
-        {"Archetype": "Searchers", "Count": f"{u_s:,.0f}", "%": f"{searcher_pct:.0f}%"},
-        {"Archetype": "Thinkers", "Count": f"{u_t:,.0f}", "%": f"{thinker_pct:.0f}%"},
-        {"Archetype": "Creators", "Count": f"{u_c:,.0f}", "%": f"{creator_pct:.0f}%"}
+        {"Archetype": "Searchers", "Pop": f"{u_s_count:,.0f}", "%": f"{searcher_pct:.0f}%"},
+        {"Archetype": "Thinkers", "Pop": f"{u_t_count:,.0f}", "%": f"{thinker_pct:.0f}%"},
+        {"Archetype": "Creators", "Pop": f"{u_c_count:,.0f}", "%": f"{creator_pct:.0f}%"}
     ]))
 
-st.subheader("Infrastructure Pathways (Mutually Exclusive Options)")
-st.table(pd.DataFrame(infra_options).style.format({"MW Needed": "{:,.0f}", "CAPEX ($B)": "${:,.2f}", "Carbon ($M/yr)": "${:,.1f}"}))
+st.subheader("Infrastructure Pathways (Mutually Exclusive)")
+st.table(pd.DataFrame(infra).style.format({"MW": "{:,.0f}", "CAPEX ($B)": "${:,.2f}", "Social Carbon ($M)": "${:,.1f}"}))
 
-# --- 9. DATA DEBUGGER ---
-with st.expander("🛠️ Debug: Spreadsheet Integration Status"):
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.write("**Tech Columns Found:**", df_tech.columns.tolist() if not df_tech.empty else "ERROR: Table not found")
-        st.write("**Global Vars:**", df_globals.iloc[:,0].tolist() if not df_globals.empty else "ERROR: Not found")
-    with col_b:
-        st.write("**Resolved Nuclear CAPEX:**", f"${smr_cap:,.0f}/MW" if smr_cap > 0 else "FAILED (Check spreadsheet spelling)")
-
-with st.expander("📚 Data Sources & Methodology"):
-    st.markdown("""
-    - **Grid Baselines:** EIA AEO 2030 Projections with regional shapes.
-    - **Usage Intensity:** EPRI 'Powering Intelligence' scaling models.
-    - **Infrastructure Costs:** NREL 2024 ATB targets via Master Log V4.
-    - **Carbon Logic:** EPA Social Cost of Carbon ($200/metric ton baseline).
-    """)
+# --- 7. THE DATA INSPECTOR (FOR JAY) ---
+with st.expander("🔍 DATA INSPECTOR: Why is my Capex 0?"):
+    st.write("The code is searching for your tables. If these are empty, your Technology data is likely on a different tab.")
+    tab1, tab2 = st.columns(2)
+    with tab1:
+        st.write("**Technology Table Found:**")
+        st.dataframe(df_tech)
+    with tab2:
+        st.write("**Global Variables Found:**")
+        st.dataframe(df_globals)
 
 st.markdown("---")
 st.markdown("<div style='text-align: center; color: gray; font-size: 0.8em;'>Created by Jay Shah</div>", unsafe_allow_html=True)
