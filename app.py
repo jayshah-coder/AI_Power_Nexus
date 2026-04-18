@@ -20,25 +20,30 @@ def load_master_log(sheet_id):
         st.stop()
     
     def extract_table(header_marker):
-        # Find the marker row
-        matches = raw_df[raw_df[0].astype(str).str.strip().str.lower() == header_marker.lower()]
-        if matches.empty: return pd.DataFrame()
+        # 1. Find the marker row
+        marker_idx = None
+        for i, val in enumerate(raw_df[0].astype(str).str.strip()):
+            if val.lower() == header_marker.lower():
+                marker_idx = i
+                break
+        if marker_idx is None: return pd.DataFrame()
         
-        start = matches.index[0]
-        # Check if this is a Title row (single cell) or the Header row (multiple cells)
-        # If the second cell is empty, the actual headers are likely in the next row
-        if start + 1 < len(raw_df) and (pd.isna(raw_df.iloc[start, 1]) or str(raw_df.iloc[start, 1]).strip() == ''):
-            start += 1
+        # 2. Find the actual header row (skip titles/empty rows)
+        header_idx = marker_idx
+        while header_idx < len(raw_df):
+            if raw_df.iloc[header_idx].notna().sum() >= 2:
+                break
+            header_idx += 1
+        if header_idx >= len(raw_df): return pd.DataFrame()
             
+        # 3. Collect data until a break
         rows = []
-        for i in range(start, len(raw_df)):
-            val = str(raw_df.iloc[i, 0]).strip().lower()
-            # Stop if we hit a new section marker or a blank line
-            if i > start and (val == '' or val == 'nan' or val.startswith('tab:')):
+        for i in range(header_idx, len(raw_df)):
+            first_val = str(raw_df.iloc[i, 0]).strip().lower()
+            if i > header_idx and (first_val == '' or first_val == 'nan' or first_val.startswith('tab:')):
                 break
             rows.append(raw_df.iloc[i].values)
         
-        if not rows: return pd.DataFrame()
         df = pd.DataFrame(rows)
         df.columns = df.iloc[0].astype(str).str.strip()
         return df[1:].reset_index(drop=True)
@@ -51,7 +56,6 @@ df_demo, df_globals, df_tech, df_bench = load_master_log(SHEET_ID)
 # --- 2. GLOBAL VARIABLE EXTRACTION ---
 def to_num(df, row_name):
     try:
-        # Search for row name anywhere in the first column
         mask = df.iloc[:, 0].astype(str).str.contains(row_name, na=False, case=False)
         val = df[mask].iloc[0, 1]
         return float(str(val).replace(',', '').replace('$', '').replace('%',''))
@@ -103,7 +107,7 @@ q_searcher = st.sidebar.slider("Searcher Queries/Day", 1, 300, 80)
 q_thinker = st.sidebar.slider("Thinker Queries/Day", 1, 200, 40)
 q_creator = st.sidebar.slider("Creator Queries/Day", 1, 100, 15)
 
-pue_slider = st.sidebar.slider("Data Center PUE", 1.05, 1.50, 1.12, help="Liquid cooling targets are ~1.05-1.10.")
+pue_slider = st.sidebar.slider("Data Center PUE", 1.05, 1.50, 1.12, help="Liquid cooling targets are ~1.05.")
 training_baseload = st.sidebar.number_input("State Training Baseload (MW)", 0, 15000, 3500 if selected_state in ['Virginia', 'Texas', 'California'] else 1200)
 
 # --- 6. GRID ENGINE ---
@@ -112,7 +116,7 @@ def get_gaussian(peak_hour, spread):
     c = np.exp(-0.5 * ((x - peak_hour) / spread) ** 2)
     return c / np.sum(c)
 
-# State-Specific Shapes
+# State-Specific Grid Shapes
 if selected_state == 'California':
     base_shape = np.array([0.7, 0.65, 0.62, 0.6, 0.62, 0.68, 0.75, 0.7, 0.6, 0.5, 0.45, 0.48, 0.52, 0.6, 0.75, 0.9, 1.0, 0.98, 0.92, 0.85, 0.8, 0.78, 0.75, 0.72])
 elif selected_state in ['New York', 'Massachusetts', 'New Jersey']:
@@ -129,28 +133,37 @@ hourly_ai_mw = ( (u_s * q_searcher * 0.3 * pue_slider / 1e6) * get_gaussian(13, 
                  (u_c * q_creator * 100.0 * pue_slider / 1e6) * get_gaussian(21, 3) +
                  training_baseload )
 
-# --- 7. INFRASTRUCTURE COST ENGINE ---
+# --- 7. FUZZY TECHNOLOGY LOOKUP ---
+def get_tech_data(tech_name):
+    if df_tech is None or df_tech.empty: return 0.0, 1.0
+    try:
+        # 1. Find columns by keyword (Resilient to spelling/spaces)
+        cols = [str(c).lower().strip() for c in df_tech.columns]
+        capex_idx = next((i for i, c in enumerate(cols) if 'capex' in c), None)
+        mult_idx = next((i for i, c in enumerate(cols) if 'multiplier' in c or 'res' in c), None)
+        
+        # 2. Find row by Technology name
+        mask = df_tech.iloc[:, 0].astype(str).str.contains(tech_name, na=False, case=False)
+        if not mask.any(): return 0.0, 1.0
+        row = df_tech[mask].iloc[0]
+        
+        # 3. Extract and clean values
+        capex = float(str(row.iloc[capex_idx]).replace('$','').replace(',','').strip()) if capex_idx is not None else 0.0
+        multiplier = 1.0
+        if mult_idx is not None:
+            mult_val = float(str(row.iloc[mult_idx]).replace('%','').strip())
+            multiplier = mult_val / 100.0 if mult_val > 10 else mult_val
+            
+        return capex, multiplier
+    except: return 0.0, 1.0
+
 peak_ai, daily_mwh_total = hourly_ai_mw.max(), hourly_ai_mw.sum()
 peak_hour = np.argmax(hourly_ai_mw)
-
-def get_tech_data(tech_name):
-    if df_tech.empty: return 0.0, 1.0
-    try:
-        # Case-insensitive search across the first column (Technology)
-        mask = df_tech.iloc[:, 0].astype(str).str.contains(tech_name, na=False, case=False)
-        row = df_tech[mask].iloc[0]
-        capex = float(str(row['Est_CAPEX_per_MW']).replace('$','').replace(',',''))
-        multiplier = float(str(row['Nameplate_Multiplier']).replace('%',''))
-        # If multiplier is a percentage (e.g. 110), convert to 1.1
-        if multiplier > 10: multiplier /= 100.0
-        return capex, multiplier
-    except Exception as e:
-        return 0.0, 1.0
 
 smr_cap, smr_res = get_tech_data('Nuclear')
 gas_cap, gas_res = get_tech_data('Gas')
 solar_cap, _ = get_tech_data('Solar')
-# Logic: If peak load is evening (Hour 18+), storage needs are significantly higher
+# Evening storage multiplier
 solar_res = 5.5 if (peak_hour >= 18 or peak_hour <= 6) else 3.5
 
 infra_options = [
@@ -166,41 +179,4 @@ with col1:
     fig = go.Figure()
     fig.add_trace(go.Scatter(y=grid_base, name="Base Grid", stackgroup='one', fillcolor='rgba(131, 192, 238, 0.4)', line=dict(width=0)))
     fig.add_trace(go.Scatter(y=hourly_ai_mw, name="AI System Load", stackgroup='one', fillcolor='rgba(255, 99, 71, 0.8)', line=dict(width=0)))
-    fig.update_layout(yaxis_title="MW", xaxis_title="Hour", hovermode="x unified", template="plotly_white")
-    st.plotly_chart(fig, use_container_width=True)
-
-with col2:
-    st.markdown("### Grid Impact Metrics")
-    st.metric("Peak AI Demand", f"{peak_ai:,.0f} MW")
-    st.metric("Grid Stress Increase", f"{(peak_ai / grid_base.max() * 100):.2f}%")
-    st.markdown("---")
-    st.markdown("### 2030 User Breakdown")
-    st.table(pd.DataFrame([
-        {"Archetype": "Searchers", "Count": f"{u_s:,.0f}", "%": f"{searcher_pct:.0f}%"},
-        {"Archetype": "Thinkers", "Count": f"{u_t:,.0f}", "%": f"{thinker_pct:.0f}%"},
-        {"Archetype": "Creators", "Count": f"{u_c:,.0f}", "%": f"{creator_pct:.0f}%"}
-    ]))
-
-st.subheader("Infrastructure Pathways (Mutually Exclusive Options)")
-st.table(pd.DataFrame(infra_options).style.format({"MW Needed": "{:,.0f}", "CAPEX ($B)": "${:,.2f}", "Carbon ($M/yr)": "${:,.1f}"}))
-
-# --- 9. DATA DEBUGGER (EXPANDER) ---
-with st.expander("🛠️ Debug: Data Load Status"):
-    st.write("If values are 0, check the column names below match your spreadsheet headers.")
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.write("**Technology Table Headers:**", df_tech.columns.tolist() if not df_tech.empty else "Not Found")
-        st.write("**Global Variables Loaded:**", df_globals.iloc[:,0].tolist() if not df_globals.empty else "Not Found")
-    with col_b:
-        st.write("**Raw Nuclear CAPEX Value:**", df_tech[df_tech.iloc[:,0].str.contains('Nuclear', na=False, case=False)].iloc[0]['Est_CAPEX_per_MW'] if not df_tech.empty else "N/A")
-
-with st.expander("📚 Data Sources & Methodology"):
-    st.markdown("""
-    - **Grid Baselines:** EIA AEO 2030 Projections with regional shapes.
-    - **Energy Benchmarks:** EPRI 'Powering Intelligence' scaling models.
-    - **Infrastructure Costs:** NREL 2024 ATB targets via Master Log V4.
-    - **Carbon Logic:** EPA Social Cost of Carbon ($200/metric ton baseline).
-    """)
-
-st.markdown("---")
-st.markdown("<div style='text-align: center; color: gray; font-size: 0.8em;'>Created by Jay Shah</div>", unsafe_allow_html=True)
+    fig.update_layout(yaxis_title="MW", xaxis_title="Hour", hover
