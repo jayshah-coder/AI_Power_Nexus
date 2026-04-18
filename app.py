@@ -179,4 +179,40 @@ with col1:
     fig = go.Figure()
     fig.add_trace(go.Scatter(y=grid_base, name="Base Grid", stackgroup='one', fillcolor='rgba(131, 192, 238, 0.4)', line=dict(width=0)))
     fig.add_trace(go.Scatter(y=hourly_ai_mw, name="AI System Load", stackgroup='one', fillcolor='rgba(255, 99, 71, 0.8)', line=dict(width=0)))
-    fig.update_layout(yaxis_title="MW", xaxis_title="Hour", hover
+    fig.update_layout(yaxis_title="MW", xaxis_title="Hour", hovermode="x unified", template="plotly_white")
+    st.plotly_chart(fig, use_container_width=True)
+
+with col2:
+    st.markdown("### Grid Impact Metrics")
+    st.metric("Peak AI Demand", f"{peak_ai:,.0f} MW")
+    st.metric("Grid Stress Increase", f"{(peak_ai / grid_base.max() * 100):.2f}%")
+    st.markdown("---")
+    st.markdown("### 2030 User Breakdown")
+    st.table(pd.DataFrame([
+        {"Archetype": "Searchers", "Count": f"{u_s:,.0f}", "%": f"{searcher_pct:.0f}%"},
+        {"Archetype": "Thinkers", "Count": f"{u_t:,.0f}", "%": f"{thinker_pct:.0f}%"},
+        {"Archetype": "Creators", "Count": f"{u_c:,.0f}", "%": f"{creator_pct:.0f}%"}
+    ]))
+
+st.subheader("Infrastructure Pathways (Mutually Exclusive Options)")
+st.table(pd.DataFrame(infra_options).style.format({"MW Needed": "{:,.0f}", "CAPEX ($B)": "${:,.2f}", "Carbon ($M/yr)": "${:,.1f}"}))
+
+# --- 9. DATA DEBUGGER ---
+with st.expander("🛠️ Debug: Spreadsheet Integration Status"):
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.write("**Tech Columns Found:**", df_tech.columns.tolist() if not df_tech.empty else "ERROR: Table not found")
+        st.write("**Global Vars:**", df_globals.iloc[:,0].tolist() if not df_globals.empty else "ERROR: Not found")
+    with col_b:
+        st.write("**Resolved Nuclear CAPEX:**", f"${smr_cap:,.0f}/MW" if smr_cap > 0 else "FAILED (Check spreadsheet spelling)")
+
+with st.expander("📚 Data Sources & Methodology"):
+    st.markdown("""
+    - **Grid Baselines:** EIA AEO 2030 Projections with regional shapes.
+    - **Usage Intensity:** EPRI 'Powering Intelligence' scaling models.
+    - **Infrastructure Costs:** NREL 2024 ATB targets via Master Log V4.
+    - **Carbon Logic:** EPA Social Cost of Carbon ($200/metric ton baseline).
+    """)
+
+st.markdown("---")
+st.markdown("<div style='text-align: center; color: gray; font-size: 0.8em;'>Created by Jay Shah</div>", unsafe_allow_html=True)
