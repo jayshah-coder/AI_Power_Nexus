@@ -7,7 +7,7 @@ import plotly.graph_objects as go
 st.set_page_config(page_title="2030 AI Power Nexus", layout="wide")
 st.title("AI Power Nexus: 2030 Summer Peak Simulation")
 
-# --- 1. DATA CONNECTIONS (V4 Master Log) ---
+# --- 1. DATA CONNECTIONS (MASTER LOG V4) ---
 SHEET_ID = "1oRgI3uZP8WINBRU6GfybW0K8BUvoz2YHXuQ0Y02QLCY"
 
 @st.cache_data(ttl=300)
@@ -26,147 +26,155 @@ def load_master_log(sheet_id):
                 break
             rows.append(raw_df.iloc[i].values)
         df = pd.DataFrame(rows)
-        df.columns = df.iloc[0] 
+        df.columns = df.iloc[0].astype(str).str.strip()
         return df[1:].reset_index(drop=True)
 
-    return extract_table('State'), extract_table('Variable_Name')
+    return extract_table('State'), extract_table('Variable_Name'), extract_table('Technology'), extract_table('Archetype')
 
-df_demo, df_globals = load_master_log(SHEET_ID)
+df_demo, df_globals, df_tech, df_bench = load_master_log(SHEET_ID)
 
-# --- 2. SIDEBAR: GEOGRAPHY & ADOPTION ---
+# --- 2. GLOBAL VARIABLE EXTRACTION ---
+# Clean data conversion
+def to_num(df, row_name, col_search='Variable_Name', val_col='Value'):
+    try:
+        val = df.loc[df[col_search].str.contains(row_name, na=False, case=False), val_col].values[0]
+        return float(str(val).replace(',', '').replace('$', ''))
+    except: return None
+
+US_POP_2030 = to_num(df_globals, 'Pop') or 340000000.0
+SOCIAL_CARBON_TAX = to_num(df_globals, 'Social') or 200.0
+
+# EIA 2030 Summer Peak Map (MW)
+SUMMER_PEAK_MAP = {
+    'Texas': 92400, 'California': 56100, 'Florida': 52800, 'New York': 33500,
+    'Pennsylvania': 30100, 'Virginia': 28200, 'Ohio': 26800, 'Illinois': 24500,
+    'North Carolina': 23500, 'Georgia': 22100, 'New Jersey': 20400, 
+    'Michigan': 19800, 'Massachusetts': 14100
+}
+
+# --- 3. SIDEBAR: GEOGRAPHY & ADOPTION ---
 st.sidebar.header("1. 2030 Population & Adoption")
 if not df_demo.empty:
-    selected_state = st.sidebar.selectbox("Select Target State", df_demo.iloc[:, 0].tolist())
-    s_row = df_demo[df_demo.iloc[:, 0] == selected_state].iloc[0]
-    def clean(v): return float(str(v).replace('%','')) / 100.0 if '%' in str(v) else float(v)
-    pop_share = clean(s_row.iloc[1])
-    age_pct   = clean(s_row.iloc[2])
+    selected_state = st.sidebar.selectbox("Select Target State", df_demo['State'].tolist())
+    s_row = df_demo[df_demo['State'] == selected_state].iloc[0]
+    def p2f(v): return float(str(v).replace('%','')) / 100.0 if '%' in str(v) else float(v)
+    pop_share = p2f(s_row.iloc[1])
+    age_pct   = p2f(s_row.iloc[2])
 else:
     selected_state, pop_share, age_pct = "New Jersey", 0.028, 0.75
 
-total_us_pop = 340_000_000 
 adoption_rate = st.sidebar.slider("AI Adoption Rate (2030)", 0.1, 1.0, 0.85)
-state_users = total_us_pop * pop_share * age_pct * adoption_rate
+state_users = US_POP_2030 * pop_share * age_pct * adoption_rate
 
-# --- 3. SIDEBAR: ARCHETYPE MIX & DESCRIPTIONS ---
+# --- 4. SIDEBAR: ARCHETYPE MIX ---
 st.sidebar.header("2. Archetype Mix (%)")
 with st.sidebar.expander("ℹ️ About Archetypes & Peak Timing"):
     st.markdown("""
-    **The Searcher:** Text-based info retrieval. Low energy (~0.3 Wh). Peaks mid-day.
-    
-    **The Thinker:** Reasoning & coding tasks. Med energy (~15 Wh). Peaks 9AM-5PM.
-    
-    **The Creator:** Video gen & autonomous agents. High energy (~100 Wh). Peaks 6PM-11PM.
+    - **Searcher:** Text retrieval. Low Energy. Peaks Mid-day.
+    - **Thinker:** Reasoning/Coding. Med Energy. Peaks 9AM-5PM.
+    - **Creator:** Video/Agents. High Energy. Peaks 6PM-11PM.
     """)
 
 thinker_pct = st.sidebar.slider("The Thinker (Reasoning) %", 0, 100, 25)
 creator_max = 100 - thinker_pct
-
 if creator_max > 0:
     creator_pct = st.sidebar.slider("The Creator (Video/Agent) %", 0, creator_max, min(15, creator_max))
 else:
-    st.sidebar.info("No room for Creator archetype.")
     creator_pct = 0
-
 searcher_pct = 100 - (thinker_pct + creator_pct)
-st.sidebar.info(f"The Searcher (Baseline): {searcher_pct}% (Remainder)")
 
-# --- 4. SIDEBAR: USAGE INTENSITY ---
-st.sidebar.header("3. Query Volume (Queries/Day)")
-st.sidebar.caption("Typical values provided as defaults.")
-q_searcher = st.sidebar.slider("Searcher Daily Volume", 1, 300, 80)
-q_thinker = st.sidebar.slider("Thinker Daily Volume", 1, 200, 40)
-q_creator = st.sidebar.slider("Creator Daily Volume", 1, 100, 15)
+# --- 5. SIDEBAR: INTENSITY & EFFICIENCY ---
+st.sidebar.header("3. Efficiency & Baseload")
+pue_slider = st.sidebar.slider("Data Center PUE (Efficiency)", 1.05, 1.50, 1.12, help="1.0 is perfect efficiency. 2030 targets are <1.15.")
+training_baseload = st.sidebar.number_input("State Training Baseload (MW)", 0, 15000, 3500 if selected_state in ['Virginia', 'Texas', 'California'] else 1200)
 
-# --- 5. SIDEBAR: INFRASTRUCTURE BASELOAD ---
-st.sidebar.header("4. Infrastructure Baseload")
-high_tier = ['Virginia', 'Texas', 'California', 'Ohio']
-default_training = 3500 if selected_state in high_tier else 1200
-training_baseload = st.sidebar.number_input("Assumed Training Load (MW)", 0, 15000, default_training)
-
-# --- 6. CALCULATIONS & CURVES ---
-def get_curve(peak_hour, spread):
+# --- 6. GRID ENGINE: REGIONAL LOAD SHAPES ---
+def get_gaussian(peak_hour, spread):
     x = np.arange(24)
     c = np.exp(-0.5 * ((x - peak_hour) / spread) ** 2)
     return c / np.sum(c)
 
-curve_search = get_curve(13, 4) 
-curve_think = (get_curve(11, 2) + get_curve(15, 2)) / 2 
-curve_create = get_curve(21, 3) 
-
-# User populations
-u_searcher = state_users * (searcher_pct / 100.0)
-u_thinker  = state_users * (thinker_pct / 100.0)
-u_creator  = state_users * (creator_pct / 100.0)
-
-# Energy usage constants (Wh)
-WH_S, WH_T, WH_C = 0.3, 15.0, 100.0
-PUE_VAL = 1.12
-
-mwh_searcher = (u_searcher * q_searcher * WH_S * PUE_VAL) / 1_000_000
-mwh_thinker  = (u_thinker * q_thinker * WH_T * PUE_VAL) / 1_000_000
-mwh_creator  = (u_creator * q_creator * WH_C * PUE_VAL) / 1_000_000
-
-hourly_ai_mw = (mwh_searcher * curve_search) + (mwh_thinker * curve_think) + (mwh_creator * curve_create) + training_baseload
-grid_base = np.array([72000, 70000, 68000, 67500, 69000, 73000, 78000, 84000, 89000, 93000, 97000, 101000, 105000, 108000, 110500, 112000, 113000, 111000, 106000, 99000, 93000, 86000, 80000, 75000])
-
-# --- 7. INFRASTRUCTURE & CARBON LOGIC ---
-peak_hour_ai = np.argmax(hourly_ai_mw)
-total_daily_energy = hourly_ai_mw.sum()
-social_carbon_tax = 200 
-
-if peak_hour_ai >= 18 or peak_hour_ai <= 6:
-    storage_multiplier = 1.9 
-    solar_label = "Solar + Storage (Evening Peak)"
+# Baseline Shape Logic
+if selected_state == 'California':
+    # The "Duck Curve": Mid-day dip due to massive solar
+    base_shape = np.array([0.7, 0.65, 0.62, 0.6, 0.62, 0.68, 0.75, 0.7, 0.6, 0.5, 0.45, 0.48, 0.52, 0.6, 0.75, 0.9, 1.0, 0.98, 0.92, 0.85, 0.8, 0.78, 0.75, 0.72])
+elif selected_state in ['New York', 'Massachusetts', 'New Jersey']:
+    # Northeast "Dual Peak": Morning and Evening spikes
+    base_shape = np.array([0.65, 0.6, 0.58, 0.58, 0.62, 0.75, 0.88, 0.92, 0.9, 0.88, 0.85, 0.85, 0.88, 0.92, 0.95, 0.98, 1.0, 0.98, 0.95, 0.9, 0.85, 0.78, 0.72, 0.68])
 else:
-    storage_multiplier = 1.0
-    solar_label = "Solar + Storage (Daytime Peak)"
+    # Standard Summer Peak (Hot regions: TX, FL)
+    base_shape = np.array([0.6, 0.55, 0.52, 0.51, 0.55, 0.62, 0.7, 0.78, 0.85, 0.9, 0.93, 0.96, 0.98, 1.0, 0.99, 0.98, 0.97, 0.94, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65])
+
+state_peak_2030 = SUMMER_PEAK_MAP.get(selected_state, 20000)
+grid_base = base_shape * state_peak_2030
+
+# AI Demand Math
+u_s, u_t, u_c = state_users * (searcher_pct/100), state_users * (thinker_pct/100), state_users * (creator_pct/100)
+mwh_s = (u_s * 80 * 0.3 * pue_slider) / 1_000_000
+mwh_t = (u_t * 40 * 15.0 * pue_slider) / 1_000_000
+mwh_c = (u_c * 15 * 100.0 * pue_slider) / 1_000_000
+
+hourly_ai_mw = (mwh_s * get_gaussian(13, 4)) + (mwh_t * get_gaussian(14, 3)) + (mwh_c * get_gaussian(21, 3)) + training_baseload
+
+# --- 7. DYNAMIC INFRASTRUCTURE PATHWAYS ---
+peak_ai = hourly_ai_mw.max()
+total_daily_mwh = hourly_ai_mw.sum()
+
+def get_tech_data(tech_name):
+    try:
+        row = df_tech[df_tech['Technology'].str.contains(tech_name, na=False)].iloc[0]
+        capex = float(str(row['Est_CAPEX_per_MW']).replace('$','').replace(',',''))
+        reserve = float(row['Nameplate_Multiplier'])
+        return capex, reserve
+    except: return 0, 1.0
+
+# Lookup from Sheet
+smr_capex, smr_res = get_tech_data('Nuclear')
+gas_capex, gas_res = get_tech_data('Gas')
+solar_capex, _ = get_tech_data('Solar')
+
+# Solar Multiplier Logic (Time-of-Use Tax)
+peak_hour = np.argmax(hourly_ai_mw)
+solar_res = 5.5 if (peak_hour >= 18 or peak_hour <= 6) else 3.5
 
 infra_options = [
-    {"Option": "Modular Nuclear (SMR)", "Capacity (MW)": hourly_ai_mw.max()*1.05, "CAPEX ($B)": (hourly_ai_mw.max()*8.5)/1000, "Carbon Cost ($M/yr)": 0},
-    {"Option": "Natural Gas (CCGT)", "Capacity (MW)": hourly_ai_mw.max()*1.10, "CAPEX ($B)": (hourly_ai_mw.max()*1.4)/1000, "Carbon Cost ($M/yr)": (total_daily_energy*365*0.430*social_carbon_tax)/1_000_000},
-    {"Option": solar_label, "Capacity (MW)": hourly_ai_mw.max()*4.5, "CAPEX ($B)": (hourly_ai_mw.max()*3.2*storage_multiplier)/1000, "Carbon Cost ($M/yr)": 0}
+    {"Pathway": "SMR (Nuclear)", "MW Needed": peak_ai * smr_res, "CAPEX ($B)": (peak_ai * smr_res * smr_capex) / 1e9, "Carbon Cost ($M/yr)": 0},
+    {"Pathway": "Natural Gas", "MW Needed": peak_ai * gas_res, "CAPEX ($B)": (peak_ai * gas_res * gas_capex) / 1e9, "Carbon Cost ($M/yr)": (total_daily_mwh * 365 * 0.430 * SOCIAL_CARBON_TAX) / 1e6},
+    {"Pathway": "Solar + Storage", "MW Needed": peak_ai * solar_res, "CAPEX ($B)": (peak_ai * solar_res * solar_capex) / 1e9, "Carbon Cost ($M/yr)": 0}
 ]
 
 # --- 8. VISUALIZATION ---
 col1, col2 = st.columns([2, 1])
-
 with col1:
-    st.subheader(f"2030 Summer Peak Simulation: {selected_state}")
+    st.subheader(f"2030 Summer Peak: {selected_state}")
     fig = go.Figure()
-    fig.add_trace(go.Scatter(y=grid_base, name="Base Grid Load", stackgroup='one', fillcolor='rgba(131, 192, 238, 0.4)', line=dict(width=0)))
+    fig.add_trace(go.Scatter(y=grid_base, name=f"{selected_state} Base", stackgroup='one', fillcolor='rgba(131, 192, 238, 0.4)', line=dict(width=0)))
     fig.add_trace(go.Scatter(y=hourly_ai_mw, name="AI System Load", stackgroup='one', fillcolor='rgba(255, 99, 71, 0.8)', line=dict(width=0)))
     fig.update_layout(yaxis_title="MW", xaxis_title="Hour", hovermode="x unified", template="plotly_white")
     st.plotly_chart(fig, use_container_width=True)
 
 with col2:
     st.markdown("### Grid Impact Metrics")
-    st.metric("Peak AI Demand", f"{hourly_ai_mw.max():,.0f} MW")
-    st.metric("Total Daily Energy", f"{total_daily_energy:,.0f} MWh")
-    st.metric("Grid Stress Increase", f"{(hourly_ai_mw.max() / grid_base.max() * 100):.2f}%")
-    
+    st.metric("Peak AI Demand", f"{peak_ai:,.0f} MW")
+    st.metric("Grid Stress Increase", f"{(peak_ai / grid_base.max() * 100):.2f}%")
     st.markdown("---")
     st.markdown("### 2030 User Breakdown")
-    st.write(f"**Total AI Users:** {state_users:,.0f}")
-    
-    pop_df = pd.DataFrame([
-        {"Archetype": "Searchers", "Count": f"{u_searcher:,.0f}", "%": f"{searcher_pct:.1f}%"},
-        {"Archetype": "Thinkers", "Count": f"{u_thinker:,.0f}", "%": f"{thinker_pct:.1f}%"},
-        {"Archetype": "Creators", "Count": f"{u_creator:,.0f}", "%": f"{creator_pct:.1f}%"}
-    ])
-    st.table(pop_df)
+    st.table(pd.DataFrame([
+        {"Archetype": "Searcher", "Pop": f"{u_s:,.0f}", "%": f"{searcher_pct:.0f}%"},
+        {"Archetype": "Thinker", "Pop": f"{u_t:,.0f}", "%": f"{thinker_pct:.0f}%"},
+        {"Archetype": "Creator", "Pop": f"{u_c:,.0f}", "%": f"{creator_pct:.0f}%"}
+    ]))
 
-st.subheader("Infrastructure Pathways (Mutually Exclusive Options)")
-st.markdown("*Select one independent technology strategy to firm the incremental AI load.*")
-st.table(pd.DataFrame(infra_options).style.format({"Capacity (MW)": "{:,.0f}", "CAPEX ($B)": "${:,.2f}", "Carbon Cost ($M/yr)": "${:,.1f}"}))
+st.subheader("Infrastructure Pathways (Mutually Exclusive)")
+st.table(pd.DataFrame(infra_options).style.format({"MW Needed": "{:,.0f}", "CAPEX ($B)": "${:,.2f}", "Carbon Cost ($M/yr)": "${:,.1f}"}))
 
-with st.expander("📚 Data Sources & Methodology"):
+with st.expander("📚 Methodology & Data Sources"):
     st.markdown("""
-    - **Base Grid:** EIA Hourly Grid Monitor projections for 2030 summer peaks.
-    - **Energy Benchmarks:** EPRI 'Powering Intelligence' 2024 scaling models.
-    - **Infrastructure Costs:** NREL Annual Technology Baseline (ATB) 2024.
-    - **Carbon Logic:** EPA 2030 Social Cost of Carbon ($200/metric ton).
+    - **Grid Baselines:** EIA AEO 2030 Projections with regional load shapes (Duck Curve for CA, Dual-Peak for NE).
+    - **Costs & Tech:** Pulled dynamically from Master Log V4 (NREL 2024 ATB Basis).
+    - **Carbon Logic:** EPA Social Cost of Carbon estimate.
     """)
 
 st.markdown("---")
 st.markdown("<div style='text-align: center; color: gray; font-size: 0.8em;'>Created by Jay Shah</div>", unsafe_allow_html=True)
+
