@@ -12,26 +12,25 @@ SHEET_ID = "1oRgI3uZP8WINBRU6GfybW0K8BUvoz2YHXuQ0Y02QLCY"
 
 @st.cache_data(ttl=60)
 def load_master_log(sheet_id):
+    # This pulls the FIRST tab of the sheet. Ensure 'Technology' and 'State' data are on the first tab!
     base_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv"
     try:
-        # We read without a header to prevent duplicate name crashes immediately
         raw_df = pd.read_csv(base_url, header=None).fillna("")
     except Exception as e:
         st.error(f"Spreadsheet Connection Error: {e}")
         return None, None, None, None
     
     def extract_table(marker):
-        # Find the marker in the first column
+        # Scan for the section marker in Column A
         matches = raw_df[raw_df[0].astype(str).str.strip().str.lower() == marker.lower()]
         if matches.empty: return pd.DataFrame()
         
         start = matches.index[0]
-        # Skip potential title rows (where only col 0 has data) to find the actual table
+        # Skip empty rows to find the actual header
         current = start
         while current < len(raw_df):
-            row_data = [str(x).strip() for x in raw_df.iloc[current] if str(x).strip() != ""]
-            if len(row_data) >= 2: # Found a row with at least two columns of data
-                break
+            row_vals = [str(x).strip() for x in raw_df.iloc[current] if str(x).strip() != ""]
+            if len(row_vals) >= 2: break
             current += 1
         
         header_idx = current
@@ -45,29 +44,20 @@ def load_master_log(sheet_id):
         if not rows: return pd.DataFrame()
         
         df = pd.DataFrame(rows)
-        # Force unique column names to prevent the "White Screen" Arrow error
+        # Force unique headers
         cols = []
         for i, val in enumerate(df.iloc[0]):
-            name = str(val).strip() if str(val).strip() != "" else f"Column_{i}"
-            if name in cols:
-                cols.append(f"{name}_{i}")
-            else:
-                cols.append(name)
-        
+            name = str(val).strip() if str(val).strip() != "" else f"Col_{i}"
+            cols.append(f"{name}_{i}" if name in cols else name)
         df.columns = cols
         return df[1:].reset_index(drop=True)
 
     return (extract_table('State'), extract_table('Variable_Name'), 
             extract_table('Technology'), extract_table('Archetype'))
 
-# Load and safeguard
 df_demo, df_globals, df_tech, df_bench = load_master_log(SHEET_ID)
 
-if df_demo is None or df_demo.empty:
-    st.warning("Waiting for data from Google Sheets... If this persists, check your 'State' marker in Column A.")
-    st.stop()
-
-# --- 2. GLOBAL CONSTANTS (Using Index-based lookup for safety) ---
+# --- 2. GLOBAL CONSTANTS ---
 def get_global(name, default):
     try:
         mask = df_globals.iloc[:, 0].astype(str).str.contains(name, case=False, na=False)
@@ -86,13 +76,16 @@ SUMMER_PEAK_MAP = {
 
 # --- 3. SIDEBAR ---
 st.sidebar.header("1. Population & Adoption")
-selected_state = st.sidebar.selectbox("Select State", df_demo.iloc[:, 0].tolist())
-s_row = df_demo[df_demo.iloc[:, 0] == selected_state].iloc[0]
-
-def p2f(v): 
-    try: return float(str(v).replace('%','')) / 100.0 if '%' in str(v) else float(v)
-    except: return 0.0
-pop_share, age_pct = p2f(s_row.iloc[1]), p2f(s_row.iloc[2])
+if df_demo is not None and not df_demo.empty:
+    selected_state = st.sidebar.selectbox("Select State", df_demo.iloc[:, 0].tolist())
+    s_row = df_demo[df_demo.iloc[:, 0] == selected_state].iloc[0]
+    def p2f(v): 
+        try: return float(str(v).replace('%','')) / 100.0 if '%' in str(v) else float(v)
+        except: return 0.0
+    pop_share, age_pct = p2f(s_row.iloc[1]), p2f(s_row.iloc[2])
+else:
+    selected_state, pop_share, age_pct = "New Jersey", 0.028, 0.75
+    st.sidebar.warning("Using default demographics (NJ).")
 
 adoption = st.sidebar.slider("AI Adoption Rate (2030)", 0.1, 1.0, 0.85)
 state_users = US_POP * pop_share * age_pct * adoption
@@ -132,31 +125,31 @@ hourly_ai_mw = ( (u_s_count * q_s * 0.3 * pue / 1e6) * get_shape(13, 4) +
                  (u_c_count * q_c * 100.0 * pue / 1e6) * get_shape(21, 3) +
                  training )
 
-# --- 5. INFRASTRUCTURE LOOKUP (Index-Based to fix Capex 0) ---
-def get_tech_data(name):
-    if df_tech is None or df_tech.empty: return 0.0, 1.0
+# --- 5. ULTRA-ROBUST TECH LOOKUP ---
+def get_tech_data(name, default_cap, default_res):
+    if df_tech is None or df_tech.empty: return default_cap, default_res
     try:
-        # Find row by name in the first column
-        row_mask = df_tech.iloc[:,0].astype(str).str.contains(name, case=False, na=False)
-        row = df_tech[row_mask].iloc[0]
-        
-        # Find column indices by searching for keywords in the header row
+        row = df_tech[df_tech.iloc[:,0].astype(str).str.contains(name, case=False, na=False)].iloc[0]
         cols = [str(c).lower() for c in df_tech.columns]
-        capex_idx = next(i for i, c in enumerate(cols) if 'capex' in c)
-        mult_idx = next(i for i, c in enumerate(cols) if 'multi' in c or 'res' in c or 'nameplate' in c)
         
-        cap = float(str(row.iloc[capex_idx]).replace('$','').replace(',','').strip())
-        res = float(str(row.iloc[mult_idx]).replace('%','').strip())
+        # Look for ANYTHING that looks like cost or capex
+        c_idx = next((i for i, c in enumerate(cols) if any(k in c for k in ['capex', 'cost', 'price', 'value'])), None)
+        # Look for ANYTHING that looks like a multiplier
+        m_idx = next((i for i, c in enumerate(cols) if any(k in c for k in ['multi', 'res', 'nameplate', 'factor'])), None)
+        
+        cap = float(str(row.iloc[c_idx]).replace('$','').replace(',','').strip()) if c_idx is not None else default_cap
+        res = float(str(row.iloc[m_idx]).replace('%','').strip()) if m_idx is not None else default_res
         if res > 10: res /= 100.0
         return cap, res
-    except: return 0.0, 1.1 # Default 1.1 multiplier if lookup fails
+    except: return default_cap, default_res
 
 peak_ai, daily_mwh = hourly_ai_mw.max(), hourly_ai_mw.sum()
 peak_hr = np.argmax(hourly_ai_mw)
 
-smr_cap, smr_res = get_tech_data('Nuclear')
-gas_cap, gas_res = get_tech_data('Gas')
-sol_cap, _ = get_tech_data('Solar')
+# Set Industry Standard Defaults in case the sheet lookup fails
+smr_cap, smr_res = get_tech_data('Nuclear', 8500000, 1.05)
+gas_cap, gas_res = get_tech_data('Gas', 1400000, 1.10)
+sol_cap, _ = get_tech_data('Solar', 3200000, 3.5)
 sol_res = 5.5 if (peak_hr >= 18 or peak_hr <= 6) else 3.5
 
 infra = [
@@ -190,17 +183,9 @@ st.subheader("Infrastructure Pathways (Mutually Exclusive Options)")
 st.table(pd.DataFrame(infra).style.format({"MW": "{:,.0f}", "CAPEX ($B)": "${:,.2f}", "Social Carbon ($M)": "${:,.1f}"}))
 
 with st.expander("🔍 DATA INSPECTOR"):
-    st.write("Headers found by code:", df_tech.columns.tolist() if not df_tech.empty else "None")
-    # Using st.table here because it's safer than st.dataframe for weird data
-    if not df_tech.empty: st.table(df_tech.head(10))
-    if not df_globals.empty: st.table(df_globals)
-
-with st.expander("📚 Data Sources & Methodology"):
-    st.markdown("""
-    - **Grid Baselines:** EIA AEO 2030 projections & regional load shapes.
-    - **Usage Intensity:** EPRI 'Powering Intelligence' scaling models.
-    - **Costing:** NREL 2024 ATB & EPA Social Cost of Carbon ($200/ton).
-    """)
+    st.write("**Columns Code is Looking At:**", df_tech.columns.tolist() if df_tech is not None else "None")
+    if df_tech is not None: st.table(df_tech)
+    if df_globals is not None: st.table(df_globals)
 
 st.markdown("---")
 st.markdown("<div style='text-align: center; color: gray; font-size: 0.8em;'>Created by Jay Shah</div>", unsafe_allow_html=True)
